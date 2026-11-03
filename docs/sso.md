@@ -45,7 +45,7 @@ to 30 seconds, and both routes clear that entry.
   key scope's tier), `null` without one, so the dashboard can gate its admin controls.
 - `GET /api/v1/auth/login` → Auth0 authorize (PKCE; state in a signed cookie).
 - `GET /api/v1/auth/callback` → code exchange, ID-token validation (JWKS), session cookie, relative redirect `/`.
-- `GET /api/v1/auth/me`, `POST /api/v1/auth/logout` (returns the Auth0 `v2/logout` URL).
+- `GET /api/v1/auth/me`, `POST /api/v1/auth/logout` (returns the provider's logout URL: its discovery document's `end_session_endpoint` with `client_id` and `post_logout_redirect_uri=<SSO_PUBLIC_ORIGIN>`, else Auth0's `v2/logout`; empty when discovery cannot be read, so the dashboard reloads).
 - `require_auth` accepts API-key bearer OR operator+ session; `require_admin`
   additionally gates the admin-tier routes. SSE streams and the jobs
   WebSocket accept the session cookie directly.
@@ -125,6 +125,32 @@ that carries the roles; it has no default) in the **root `.env`** — all-or-not
 - Static IPs on the pinned frontend network: nginx `.10`, tunnel `.11`;
   `FORWARDED_ALLOW_IPS` trusts exactly those two, so the Cloudflare-edge
   visitor IP reaches the rate limiter and audit trail.
+
+## Another OIDC provider
+
+The `AUTH0_*` settings name any OIDC provider that publishes a discovery document at
+`<AUTH0_ISSUER>/.well-known/openid-configuration`; Auth0 is only the first one embry0 met.
+Keycloak, for example:
+
+| Setting | Value |
+|---|---|
+| `AUTH0_ISSUER` | `https://<keycloak-host>/realms/<realm>` |
+| `AUTH0_CLIENT_ID`, `AUTH0_CLIENT_SECRET` | a confidential client: standard flow, PKCE S256, client authentication by secret (embry0 sends it with HTTP Basic) |
+| `SSO_ROLES_CLAIM` | the claim a client-role mapper writes into the ID token, for example `embry0_roles` |
+
+The client must allow the redirect `<SSO_PUBLIC_ORIGIN>/api/v1/auth/callback` and the
+post-logout redirect `<SSO_PUBLIC_ORIGIN>`. Give it the roles `embry0-admin` and
+`embry0-operator`, and a mapper that puts the person's roles of that client into the ID
+token (Keycloak: a "User Client Role" mapper, multivalued, "Add to ID token" on).
+
+Two rules hold for every provider:
+
+- **The ID token's `iss` must equal the discovery document's `issuer` exactly.** Auth0 writes
+  it with a trailing slash and Keycloak without one, so `AUTH0_ISSUER` may be written either
+  way. A discovery document that names another issuer is refused (502, `sso_discovery_issuer_mismatch`
+  in the log).
+- **Sign-out goes through the provider's `end_session_endpoint`** when the discovery document
+  has one. An Auth0 tenant that advertises none keeps `v2/logout`.
 
 ## Tenant objects
 

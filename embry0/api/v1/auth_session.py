@@ -1,8 +1,10 @@
-"""Auth0 SSO endpoints (RAV-1069): server-side OIDC, no frontend SDK.
+"""SSO endpoints (RAV-1069): server-side OIDC, no frontend SDK.
 
 A confidential client: authorization-code + PKCE against the deployment's
-own Auth0 tenant, with roles read off the ID token claim named by
-``SSO_ROLES_CLAIM``. Built on FastAPI + joserfc. Mounted WITHOUT the router-level API-key
+own OIDC provider (an Auth0 tenant, Keycloak, or any provider that publishes
+a discovery document; the settings keep their ``AUTH0_*`` names), with roles
+read off the ID token claim named by ``SSO_ROLES_CLAIM``. Built on FastAPI +
+joserfc. Mounted WITHOUT the router-level API-key
 dependency — /login and /callback are the unauthenticated entry, /check is
 the frontend's cheap probe, /me and /logout act on the session cookie.
 
@@ -43,7 +45,30 @@ router = APIRouter(prefix="/auth")
 
 
 def _issuer(config: Any) -> str:
+    """The configured issuer with one trailing slash: the base the discovery path is joined to."""
     return str(config.auth0_issuer).rstrip("/") + "/"
+
+
+class _IssuerMismatch(Exception):
+    """The discovery document names an issuer other than the configured one."""
+
+
+def _expected_iss(config: Any, meta: dict[str, Any]) -> str:
+    """The ``iss`` an ID token must carry, exactly.
+
+    OIDC Discovery 1.0 section 4.3: the document's ``issuer`` equals the issuer
+    it was fetched for, and ID tokens carry that value. Auth0 writes it with a
+    trailing slash, Keycloak and most other providers without one, so the
+    configured value is compared with the slash ignored and the document's own
+    spelling is the one enforced. A document without ``issuer`` keeps the
+    configured value with its slash, as before.
+    """
+    advertised = meta.get("issuer")
+    if advertised is None:
+        return _issuer(config)
+    if str(advertised).rstrip("/") + "/" != _issuer(config):
+        raise _IssuerMismatch(str(advertised))
+    return str(advertised)
 
 
 def _callback_url(config: Any) -> str:
@@ -186,6 +211,11 @@ async def callback(request: Request, code: str = "", state: str = "") -> Redirec
         raise HTTPException(status_code=400, detail="Invalid or expired login state — retry /api/v1/auth/login")
 
     meta = await _oidc_metadata(request)
+    try:
+        expected_iss = _expected_iss(config, meta)
+    except _IssuerMismatch as exc:
+        logger.error("sso_discovery_issuer_mismatch", configured=_issuer(config), advertised=str(exc))
+        raise HTTPException(status_code=502, detail="The sign-in provider names another issuer") from None
     async with httpx.AsyncClient(timeout=15) as client:
         token_resp = await client.post(
             meta["token_endpoint"],
@@ -207,7 +237,7 @@ async def callback(request: Request, code: str = "", state: str = "") -> Redirec
     # #506: joserfc's decode() checks the signature; the registry checks
     # iss, aud and the time claims.
     registry = JWTClaimsRegistry(
-        iss={"essential": True, "value": _issuer(config)},
+        iss={"essential": True, "value": expected_iss},
         aud={"essential": True, "value": config.auth0_client_id},
     )
     claims: dict[str, Any] | None = None
@@ -289,17 +319,36 @@ async def me(request: Request) -> dict[str, Any]:
     }
 
 
+async def _logout_url(request: Request) -> str:
+    """The provider's RP-initiated logout URL, sending the person back to the dashboard.
+
+    The discovery document's ``end_session_endpoint`` (OIDC RP-Initiated Logout
+    1.0) when it has one; else Auth0's own ``v2/logout``, for a tenant that
+    advertises none. Empty when discovery cannot be read: the dashboard then
+    reloads, and the cleared cookie lands on the sign-in screen.
+    """
+    config = request.app.state.config
+    try:
+        meta = await _oidc_metadata(request)
+    except (httpx.HTTPError, ValueError):
+        logger.warning("sso_logout_discovery_failed")
+        return ""
+    end_session = meta.get("end_session_endpoint")
+    if end_session:
+        query = urlencode({"client_id": config.auth0_client_id, "post_logout_redirect_uri": config.sso_public_origin})
+        return f"{end_session}{'&' if '?' in str(end_session) else '?'}{query}"
+    return (
+        _issuer(config)
+        + "v2/logout?"
+        + f"client_id={quote(config.auth0_client_id)}&returnTo={quote(config.sso_public_origin)}"
+    )
+
+
 @router.post("/logout")
 async def logout(request: Request) -> JSONResponse:
-    """Clear the session cookie and hand back the Auth0 RP-initiated logout URL."""
+    """Clear the session cookie and hand back the provider's RP-initiated logout URL."""
     config = request.app.state.config
-    logout_url = ""
-    if config.sso_enabled:
-        logout_url = (
-            _issuer(config)
-            + "v2/logout?"
-            + f"client_id={quote(config.auth0_client_id)}&returnTo={quote(config.sso_public_origin)}"
-        )
+    logout_url = await _logout_url(request) if config.sso_enabled else ""
     response = JSONResponse({"logoutUrl": logout_url})
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response

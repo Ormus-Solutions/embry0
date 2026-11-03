@@ -36,7 +36,8 @@ describes what embry0 does rather than listing changes.
   from the dashboard, Telegram or a GitHub comment.
 - **Dashboard.** A React app with an issue tracker that syncs both ways with
   GitHub, and live agent activity, costs and QA evidence over WebSocket. SSO is
-  optional ([docs/sso.md](docs/sso.md)).
+  optional, against Auth0, Keycloak or any OIDC provider with a discovery
+  document ([docs/sso.md](docs/sso.md)).
 - **Budget caps** per job, per day and per month.
 - **Credential registry** for forge tokens and LLM accounts
   ([docs/credentials.md](docs/credentials.md)).
