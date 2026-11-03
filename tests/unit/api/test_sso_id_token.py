@@ -69,7 +69,15 @@ class _Idp:
         return httpx.Response(404)
 
 
-def _callback(monkeypatch, idp: _Idp, cached_jwks: dict[str, Any] | None = None) -> httpx.Response:
+def _callback(
+    monkeypatch,
+    idp: _Idp,
+    cached_jwks: dict[str, Any] | None = None,
+    *,
+    issuer: str | None = None,
+    configured_issuer: str = ISSUER,
+) -> httpx.Response:
+    """Drive the callback; ``issuer`` is the discovery document's, absent unless given."""
     import embry0.api.v1.auth_session as auth_session
 
     real_client = httpx.AsyncClient
@@ -78,8 +86,10 @@ def _callback(monkeypatch, idp: _Idp, cached_jwks: dict[str, Any] | None = None)
         return real_client(*args, transport=httpx.MockTransport(idp.handler), **kwargs)
 
     monkeypatch.setattr(auth_session.httpx, "AsyncClient", _client)
-    app = _app(_config())
+    app = _app(_config(auth0_issuer=configured_issuer))
     app.state.oidc_metadata = {"token_endpoint": TOKEN_URL, "jwks_uri": JWKS_URL}
+    if issuer is not None:
+        app.state.oidc_metadata["issuer"] = issuer
     if cached_jwks is not None:
         app.state.oidc_jwks = cached_jwks
     client = TestClient(app)
@@ -140,3 +150,43 @@ def test_a_cached_jwks_that_has_the_key_is_not_refetched(monkeypatch):
     resp = _callback(monkeypatch, idp, cached_jwks=_jwks(KEY))
     assert resp.status_code == 303
     assert idp.jwks_fetches == 0, "the JWKS was fetched although the cached set had the key"
+
+
+# An OIDC provider names its issuer in its discovery document, and an ID token's
+# ``iss`` must equal it exactly (OIDC Discovery 1.0, section 4.3). Auth0 writes it
+# with a trailing slash; Keycloak (``https://<host>/realms/<realm>``) and most others
+# without one.
+SLASHLESS = "https://idp.example.com/realms/team"
+
+
+def test_an_issuer_without_a_trailing_slash_logs_in(monkeypatch):
+    resp = _callback(
+        monkeypatch,
+        _Idp(_id_token(iss=SLASHLESS), _jwks(KEY)),
+        issuer=SLASHLESS,
+        configured_issuer=SLASHLESS,
+    )
+    assert resp.status_code == 303, f"an ID token from a slashless issuer was refused: {resp.status_code} {resp.text}"
+
+
+def test_a_slashless_issuer_still_refuses_a_token_with_the_slash(monkeypatch):
+    resp = _callback(
+        monkeypatch,
+        _Idp(_id_token(iss=SLASHLESS + "/"), _jwks(KEY)),
+        issuer=SLASHLESS,
+        configured_issuer=SLASHLESS,
+    )
+    assert resp.status_code == 400, f"iss {SLASHLESS}/ was accepted for issuer {SLASHLESS}: {resp.status_code}"
+
+
+def test_an_issuer_with_a_trailing_slash_still_logs_in(monkeypatch):
+    """The Auth0 form: the discovery document and the token both end in a slash."""
+    resp = _callback(monkeypatch, _Idp(_id_token(), _jwks(KEY)), issuer=ISSUER)
+    assert resp.status_code == 303, f"an Auth0-form issuer was refused: {resp.status_code} {resp.text}"
+
+
+def test_a_discovery_document_naming_another_issuer_is_refused(monkeypatch):
+    idp = _Idp(_id_token(iss="https://other.example.com/"), _jwks(KEY))
+    resp = _callback(monkeypatch, idp, issuer="https://other.example.com/")
+    assert resp.status_code == 502, f"a discovery document for another issuer was trusted: {resp.status_code}"
+    assert "embry0_session=" not in resp.headers.get("set-cookie", "")

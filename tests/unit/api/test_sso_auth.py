@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from unittest.mock import patch
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -240,15 +241,57 @@ def test_callback_rejects_bad_state():
     assert resp.status_code == 400
 
 
-def test_logout_clears_cookie_and_returns_url():
-    client = TestClient(_app(_config()))
+def _logout(metadata: dict | None) -> object:
+    app = _app(_config())
+    if metadata is not None:
+        app.state.oidc_metadata = metadata
+    client = TestClient(app)
     client.cookies.set(SESSION_COOKIE, _session_cookie(["embry0-admin"]))
-    resp = client.post("/api/v1/auth/logout")
+    return client.post("/api/v1/auth/logout")
+
+
+def test_logout_clears_cookie_and_returns_url():
+    resp = _logout(
+        {"issuer": "https://tenant.example.com/", "token_endpoint": "https://tenant.example.com/oauth/token"}
+    )
     assert resp.status_code == 200
     assert "v2/logout" in resp.json()["logoutUrl"]
     assert 'embry0_session="";' in resp.headers.get("set-cookie", "") or "embry0_session=;" in resp.headers.get(
         "set-cookie", ""
     )
+
+
+def test_logout_without_an_end_session_endpoint_is_auth0s_own_route():
+    """A tenant that advertises no end_session_endpoint keeps Auth0's v2/logout, byte for byte as before."""
+    resp = _logout({"issuer": "https://tenant.example.com/"})
+    assert resp.json()["logoutUrl"] == (
+        "https://tenant.example.com/v2/logout?client_id=client-id&returnTo=https%3A//embry0.example.com"
+    )
+
+
+def test_logout_goes_through_the_advertised_end_session_endpoint():
+    """OIDC RP-initiated logout: the provider's own endpoint, sending the person back to the dashboard."""
+    end = "https://tenant.example.com/realms/team/protocol/openid-connect/logout"
+    resp = _logout({"issuer": "https://tenant.example.com/", "end_session_endpoint": end})
+    assert resp.json()["logoutUrl"] == (
+        f"{end}?client_id=client-id&post_logout_redirect_uri=https%3A%2F%2Fembry0.example.com"
+    ), f"logout ignored the advertised end_session_endpoint: {resp.json()['logoutUrl']}"
+
+
+def test_logout_still_clears_the_cookie_when_discovery_fails(monkeypatch):
+    import embry0.api.v1.auth_session as auth_session
+
+    real_client = httpx.AsyncClient
+
+    def _client(*args, **kwargs):
+        return real_client(*args, transport=httpx.MockTransport(lambda _r: httpx.Response(503)), **kwargs)
+
+    monkeypatch.setattr(auth_session.httpx, "AsyncClient", _client)
+    resp = _logout(None)
+    assert resp.status_code == 200
+    assert resp.json()["logoutUrl"] == "", "a logout URL was guessed while discovery was down"
+    cookie = resp.headers.get("set-cookie", "")
+    assert 'embry0_session="";' in cookie or "embry0_session=;" in cookie
 
 
 # ---------------------------------------------------------------------------
