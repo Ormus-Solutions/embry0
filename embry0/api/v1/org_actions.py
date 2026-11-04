@@ -149,12 +149,12 @@ async def run_organization_action(owner: str, body: ActionBody, request: Request
     forge_client = None
     # The owner's token is fetched only when a hook could actually be made:
     # an action that is skipped for every repository needs no credential.
-    org_hook = False
+    org_hook = None
     if body.action == "hook" and org.forge == "github" and hooks_allowed and webhook_url and webhook_secret:
         forge_client = await _forge_client(request, org.owner, org.forge, org.credential_id)
         # Read once for the whole run: the organization's own webhook delivers for every repository (ADR 0012).
-        origin = webhook_url.removesuffix(org_actions.GITHUB_HOOK_PATH)
-        org_hook = await org_discovery.organization_hook_state(forge_client, org.owner, (origin,)) is True
+        origin = org_discovery.public_origin(str(getattr(config, "webhook_public_url", "") or ""))
+        org_hook = await org_discovery.organization_hook_state(forge_client, org.owner, (origin,) if origin else ())
     stacks_repo = getattr(st, "watcher_stacks_repo", None)
     ctx = ActionContext(
         owner=org.owner,

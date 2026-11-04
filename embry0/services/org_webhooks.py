@@ -16,6 +16,9 @@ from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
 
 ORG_HOOK_EVENTS = ("issues", "issue_comment", "pull_request", "workflow_run")
+#: The events intake starts work from (the trigger label, answers, pull requests);
+#: a hook that sends fewer delivers too little to stand in for a repository hook.
+INTAKE_EVENTS = ("issues", "issue_comment", "pull_request")
 WEBHOOK_PATH = "/api/v1/webhook"
 
 
@@ -104,6 +107,11 @@ async def list_org_hooks(client: _Reader, owner: str) -> list[OrgHook] | None:
     if not isinstance(body, list):
         return None
     return [hook for hook in (_hook(item) for item in body) if hook is not None]
+
+
+def sends_intake_events(hook: OrgHook) -> bool:
+    """Whether ``hook`` sends every event intake reads, GitHub's ``*`` included."""
+    return "*" in hook.events or set(INTAKE_EVENTS) <= set(hook.events)
 
 
 def hook_pointing_at(hooks: list[OrgHook], target: str) -> OrgHook | None:
