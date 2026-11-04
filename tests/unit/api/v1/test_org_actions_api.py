@@ -170,9 +170,12 @@ class FakeResp:
 class FakeForge:
     def __init__(self) -> None:
         self.hooks: list[dict[str, Any]] = []
+        self.org_hooks: list[dict[str, Any]] = []
         self.posts: list[Any] = []
 
     async def get(self, path: str, **kwargs: Any) -> FakeResp:
+        if path.startswith("/orgs/"):
+            return FakeResp(200, self.org_hooks)
         return FakeResp(200, self.hooks)
 
     async def post(self, path: str, *, json: Any = None, **kwargs: Any) -> FakeResp:
@@ -358,6 +361,21 @@ async def test_a_hook_on_the_dashboard_origins_is_not_this_deployments(monkeypat
         resp = await client.post("/api/v1/orgs/acme/actions", json={"action": "hook", "repos": ["acme/widgets"]})
     assert resp.json()["results"][0]["outcome"] == "done", resp.text
     assert [post["config"]["url"] for post in app.state.fake_forge.posts] == [HOOK_URL]
+
+
+@pytest.mark.asyncio
+async def test_hook_reads_the_organization_webhook_and_adds_no_repository_hook(app: Any) -> None:
+    """The route reads the organization's hooks once and hands the answer to the action."""
+    app.state.fake_forge.org_hooks = [{"id": 9, "active": True, "events": ["issues"], "config": {"url": HOOK_URL}}]
+    async with _client(app) as client:
+        resp = await client.post(
+            "/api/v1/orgs/acme/actions", json={"action": "hook", "repos": ["acme/widgets", "acme/gadgets"]}
+        )
+    results = resp.json()["results"]
+    assert [r["outcome"] for r in results] == ["already", "already"], resp.text
+    assert "organization webhook" in results[0]["detail"]
+    assert app.state.fake_forge.posts == [], "no repository hook next to the organization's"
+    assert app.state.forge_clients_built == ["acme"]
 
 
 @pytest.mark.asyncio

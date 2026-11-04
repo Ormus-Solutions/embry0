@@ -24,6 +24,7 @@ from urllib.parse import quote, urlsplit
 import structlog
 
 from embry0.execution.forge_client import Listing
+from embry0.services.org_webhooks import list_org_hooks
 
 logger = structlog.get_logger(__name__)
 
@@ -187,6 +188,24 @@ def hook_state(hooks: list[Any], origins: tuple[str, ...]) -> bool | None:
     return hook_points_here(hooks, origins)
 
 
+async def organization_hook_state(client: _Client, owner: str, origins: tuple[str, ...]) -> bool | None:
+    """Whether the organization's own webhook delivers to this deployment (ADR 0012).
+
+    GitHub sends an organization webhook every event of every repository
+    under the owner, so one that points here stands in for a hook on each of
+    them. True when an active hook of ``owner`` posts to one of ``origins``,
+    False when none does, and None when there is no origin to compare
+    against or the credential cannot list the organization's hooks: unknown
+    is not no, and each repository's own hooks then decide alone.
+    """
+    if not any(origins):
+        return None
+    hooks = await list_org_hooks(client, owner)
+    if hooks is None:
+        return None
+    return any(hook.active and any(origin and hook.url.startswith(origin) for origin in origins) for hook in hooks)
+
+
 def hook_hosts(hooks: list[Any]) -> list[str]:
     """The hostnames a repository's hooks deliver to, never the full URL
     (a hook URL can carry a token in its query)."""
@@ -219,12 +238,19 @@ def ui_evidence(
 
 
 async def scan_repository(
-    client: _Client, owner: str, record: dict[str, Any], *, hook_origins: tuple[str, ...]
+    client: _Client,
+    owner: str,
+    record: dict[str, Any],
+    *,
+    hook_origins: tuple[str, ...],
+    org_hook: bool | None = None,
 ) -> RepoFacts:
     """Facts for one repository from its forge record plus a few file reads.
 
     ``hook_origins`` is the deployment's WEBHOOK_PUBLIC_URL, or empty when it
-    is unset; see :func:`hook_state`.
+    is unset; see :func:`hook_state`. ``org_hook`` is the owner's
+    :func:`organization_hook_state`: when True, the repository's events reach
+    this deployment whatever its own hooks are, so its hook is present.
     """
     full = str(record.get("full_name") or f"{owner}/{record.get('name', '')}")
     facts = RepoFacts(
@@ -304,6 +330,9 @@ async def scan_repository(
         detail["hook_count"] = None
         detail["hook_hosts"] = []
         detail["hook_present"] = None
+    detail["org_hook"] = org_hook
+    if org_hook is True:
+        detail["hook_present"] = True
     facts.facts = detail
     return facts
 
@@ -371,9 +400,11 @@ async def discover(
     listing = await list_repositories(client, owner, owner_kind)
     records = listing.items
     total = len(records)
+    # Only an organization carries hooks of its own; a user's repositories have theirs alone.
+    org_hook = await organization_hook_state(client, owner, hook_origins) if owner_kind == "organization" else None
     out: list[RepoFacts] = []
     for index, record in enumerate(records, start=1):
-        facts = await scan_repository(client, owner, record, hook_origins=hook_origins)
+        facts = await scan_repository(client, owner, record, hook_origins=hook_origins, org_hook=org_hook)
         if not facts.archived:
             facts.facts.update(await embry0_state(facts.repo))
         out.append(facts)

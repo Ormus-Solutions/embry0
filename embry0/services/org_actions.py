@@ -103,8 +103,11 @@ class ActionContext:
     ``facts`` maps a repository (any case) to its discovery row. A ``None``
     collaborator fails only the action that needs it, with the reason, so a
     deployment without a watcher or an executor still gets an honest answer
-    for the other actions. ``force`` is for onboard only: start another job
-    even when the last one completed without storing a QA config.
+    for the other actions. ``org_hook`` is whether the owner's organization
+    webhook delivers here, read live by the caller for the hook action: a
+    repository hook next to it would make the forge send each event twice.
+    ``force`` is for onboard only: start another job even when the last one
+    completed without storing a QA config.
     ``refusal`` says what the caller is refused with on a repository, or
     None: a repository it is refused on fails with that reason, and the
     action does not touch it.
@@ -122,6 +125,7 @@ class ActionContext:
     hooks_allowed: bool | None = None
     webhook_url: str | None = None
     webhook_secret: str = ""
+    org_hook: bool = False
     force: bool = False
     refusal: Callable[[str], Awaitable[str | None]] | None = None
 
@@ -181,6 +185,10 @@ async def _hook(ctx: ActionContext, repo: str, facts: dict[str, Any], dry_run: b
         return ActionResult(repo, "skipped", "GITHUB_WEBHOOK_SECRET is not set, so deliveries could not be verified")
     if ctx.forge_client is None:
         return ActionResult(repo, "failed", "no forge client for the owner's credential")
+    if ctx.org_hook:
+        return ActionResult(
+            repo, "already", "the organization webhook delivers its events here, so it needs no hook of its own"
+        )
     listing = await ctx.forge_client.get(f"/repos/{repo}/hooks", params={"per_page": 100})
     if listing.status_code != 200:
         return ActionResult(repo, "skipped", f"cannot list webhooks (HTTP {listing.status_code})")

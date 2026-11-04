@@ -289,6 +289,16 @@ async def test_hook_already_comes_from_the_live_listing_on_the_webhook_origin() 
 
 
 @pytest.mark.asyncio
+async def test_hook_is_already_when_the_organization_webhook_delivers_here() -> None:
+    """A repository hook next to the organization's would make GitHub send each event two times (ADR 0012)."""
+    ctx = context(org_hook=True)
+    results = await run_action(ctx, "hook", ["acme/widgets", "acme/gadgets"])
+    assert outcomes(results) == [("acme/widgets", "already"), ("acme/gadgets", "already")]
+    assert all("organization webhook" in r.detail for r in results)
+    assert ctx.forge_client.posts == []  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
 async def test_hook_present_in_the_facts_alone_is_not_already() -> None:
     """Discovery's flag may have been set by another origin; only the live listing counts."""
     ctx = context()

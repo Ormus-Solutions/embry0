@@ -89,6 +89,8 @@ What it needs:
 
 Install it with `POST /api/v1/orgs/{owner}/webhook` (admin), or the MCP tool `org_webhook_install(owner, confirm=true)`. The call is idempotent: a hook already pointing at the target answers `outcome: already` and writes nothing. `GET /api/v1/orgs/{owner}/webhook` asks GitHub whether a hook points here (`installed`, `hook`, `target_url`) and lists every organization hook the credential can see; a hook that points elsewhere is listed by its origin only, because such URLs often carry another service's token. The events subscribed are `issues`, `issue_comment`, `pull_request` and `workflow_run`, the four the receiver handles.
 
+Discovery reads the organization's hooks once per run. When an active one posts to `WEBHOOK_PUBLIC_URL`, every repository under the owner records `org_hook: true` and `hook_present: true`, whatever its own hooks are, so the needs list asks for no repository hook and the `hook` action answers `already` without adding one: a repository hook next to the organization's would make GitHub send each event two times. When the credential cannot list the organization's hooks, or `WEBHOOK_PUBLIC_URL` is unset, `org_hook` is `null` and each repository's own hooks decide as before. A user owner has no organization hooks, so they are not read.
+
 The receiver's organization gate is additive: every delivery reaches the same handlers it would reach without organizations. What the gate adds for a delivery for a repository that is not registered depends on the owner:
 
 | Owner | What the gate adds |
