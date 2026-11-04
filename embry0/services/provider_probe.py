@@ -114,8 +114,8 @@ async def probe_llm_secret(provider: str, kind: str, secret: str, *, base_url: s
     raise ValueError(f"cannot probe {provider} {kind}")
 
 
-async def probe_anthropic() -> list[ProbeCheck]:
-    """Probe each configured Anthropic credential source independently."""
+async def _probe_anthropic_env() -> list[ProbeCheck]:
+    """Each Anthropic credential the process environment carries, probed independently."""
     checks: list[ProbeCheck] = []
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
@@ -125,12 +125,63 @@ async def probe_anthropic() -> list[ProbeCheck]:
         # Claude Code OAuth tokens authenticate as a bearer with the OAuth
         # beta header — a header change, not a key swap.
         checks.append(await probe_llm_secret("anthropic", "llm_oauth", oauth_token))
+    return checks
+
+
+async def _probe_resolved_anthropic(cred: Any) -> ProbeCheck:
+    """Probe the account the resolver chose, labelled by where the resolver found it."""
+    source = "registry" if cred.source == "registry" else ("oauth" if cred.kind == "llm_oauth" else "api_key")
+    if cred.kind not in ("llm_api_key", "llm_oauth"):
+        return ProbeCheck(source, STATUS_ERROR, f"cannot probe an anthropic {cred.kind} credential")
+    check = await probe_llm_secret("anthropic", cred.kind, cred.secret)
+    return ProbeCheck(source, check.status, check.message)
+
+
+async def probe_anthropic(resolver: Any = None) -> list[ProbeCheck]:
+    """Probe the Anthropic account a job with no repository binding would run with.
+
+    With a resolver the registry answers first, in the order a job resolves
+    (the global pool, then the environment), so the test covers the account
+    that actually runs: before #7 this read ``os.environ`` alone, so a
+    deployment whose only account is in the registry was told
+    ``not_configured`` while /config/models called the same provider available
+    and jobs ran on that very account. The result names the source it tested
+    and never carries the secret. No use is recorded (no job id).
+
+    A registry account is probed by its own kind. When the resolver's answer
+    comes from the environment, each environment source is probed on its own
+    as before — except where the two variables carry none, which is the
+    resolver's remaining env source, the orchestrator's Claude credentials
+    file. Without a resolver the environment alone is probed.
+    """
+    from embry0.services.credentials.resolver import CredentialMissingError, CredentialUnavailableError
+
+    resolved: Any = None
+    if resolver is not None:
+        try:
+            resolved = await resolver.resolve_llm("", "anthropic")
+        except CredentialMissingError:
+            resolved = None
+        except CredentialUnavailableError as exc:
+            # A bound account the registry cannot serve (quarantined, disabled,
+            # undecryptable) is the operator's answer, not a silent env fallback.
+            # The message names labels and reasons, never a secret.
+            return [ProbeCheck("registry", STATUS_ERROR, str(exc))]
+        except Exception as exc:  # noqa: BLE001 — a registry outage must not hide a working env account
+            logger.warning("provider_probe_resolver_error", provider="anthropic", error=str(exc)[:200])
+            resolved = None
+        if resolved is not None and resolved.source == "registry":
+            return [await _probe_resolved_anthropic(resolved)]
+    checks = await _probe_anthropic_env()
+    if not checks and resolved is not None:
+        checks.append(await _probe_resolved_anthropic(resolved))
     if not checks:
         checks.append(
             ProbeCheck(
                 "none",
                 STATUS_NOT_CONFIGURED,
-                "Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set.",
+                "No Anthropic account: bind one in the credential registry, "
+                "or set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.",
             )
         )
     return checks

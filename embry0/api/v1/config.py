@@ -510,7 +510,7 @@ async def test_catalog_provider(
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_name!r}")
 
     if provider_name == "anthropic":
-        checks = await probe_anthropic()
+        checks = await probe_anthropic(getattr(request.app.state, "credential_resolver", None))
     elif provider_name == "xai":
         checks = await probe_xai(getattr(request.app.state, "xai_refresher", None))
     else:  # an enabled OpenAI-compatible provider

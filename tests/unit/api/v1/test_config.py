@@ -322,10 +322,17 @@ async def test_provider_live_test_unknown_provider_404(app):
 async def test_provider_live_test_anthropic_reports_checks(app, monkeypatch):
     from embry0.services.provider_probe import ProbeCheck
 
-    async def fake_probe():
+    seen: dict[str, object] = {}
+
+    async def fake_probe(resolver=None):
+        seen["resolver"] = resolver
         return [ProbeCheck("oauth", "ok", "authenticated and reachable")]
 
     monkeypatch.setattr("embry0.services.provider_probe.probe_anthropic", fake_probe)
+    # #7: the probe must test the account a job would get, so the endpoint hands
+    # it the app's credential resolver, as the xai/openai-compatible branches do.
+    resolver = object()
+    app.state.credential_resolver = resolver
     emit = AsyncMock()
     monkeypatch.setattr("embry0.api.v1.config.emit_audit", emit)
     transport = ASGITransport(app=app)
@@ -342,6 +349,7 @@ async def test_provider_live_test_anthropic_reports_checks(app, monkeypatch):
     # Audit carries the outcome only — never credentials or provider payloads.
     assert emit.call_args.args[1] == "provider_connection_tested"
     assert emit.call_args.kwargs["details"] == {"provider": "anthropic", "status": "ok"}
+    assert seen["resolver"] is resolver, "the Anthropic probe must be given the app's credential resolver (#7)"
 
 
 @pytest.mark.asyncio
