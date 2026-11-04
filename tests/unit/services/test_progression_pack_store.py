@@ -9,6 +9,8 @@ from __future__ import annotations
 import struct
 import zoneinfo
 from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -385,26 +387,44 @@ PYTHON_ONLY_ZONE = "PythonOnly/Zone"
 UTC_TZIF = b"TZif" + b"\x00" * 16 + struct.pack(">6l", 0, 0, 0, 0, 1, 4) + struct.pack(">lBB", 0, 0, 0) + b"UTC\x00"
 
 
-@pytest.fixture
-def python_only_zone(tmp_path: Path) -> Iterator[str]:
-    """A zone ``zoneinfo`` reads and Postgres does not, on any host.
+@contextmanager
+def _python_only_zone(directory: Path) -> Iterator[str]:
+    """A zone ``zoneinfo`` reads and Postgres does not, on any host, until the block ends.
 
     The case these tests measure used ``localtime``, which ``zoneinfo`` reads only where tzdata ships a file of
     that name (Debian and Ubuntu do; Arch does not), so on other hosts the Python check refused it first and the
     database check was never reached. A zone written to a directory put first on ``zoneinfo``'s search path is
-    read everywhere, and no database has its name.
+    read everywhere, and no database has its name. Only this zone leaves the ``ZoneInfo`` cache after: clearing
+    the whole cache would give later code new objects for zones it already holds, and ``ZoneInfo`` compares by
+    identity.
     """
-    zone_file = tmp_path / PYTHON_ONLY_ZONE
+    zone_file = directory / PYTHON_ONLY_ZONE
     zone_file.parent.mkdir(parents=True)
     zone_file.write_bytes(UTC_TZIF)
     saved = zoneinfo.TZPATH
-    zoneinfo.reset_tzpath(to=[str(tmp_path), *saved])
-    zoneinfo.ZoneInfo.clear_cache()
+    zoneinfo.reset_tzpath(to=[str(directory), *saved])
     try:
         yield PYTHON_ONLY_ZONE
     finally:
         zoneinfo.reset_tzpath(to=list(saved))
-        zoneinfo.ZoneInfo.clear_cache()
+        zoneinfo.ZoneInfo.clear_cache(only_keys=[PYTHON_ONLY_ZONE])
+
+
+@pytest.fixture
+def python_only_zone(tmp_path: Path) -> Iterator[str]:
+    with _python_only_zone(tmp_path) as zone:
+        yield zone
+
+
+def test_the_python_only_zone_is_gone_after_its_block(tmp_path: Path) -> None:
+    utc = zoneinfo.ZoneInfo("UTC")
+    saved = zoneinfo.TZPATH
+    with _python_only_zone(tmp_path) as zone:
+        assert zoneinfo.ZoneInfo(zone).utcoffset(None) == timedelta(0)
+    assert zoneinfo.TZPATH == saved, "the search path is restored"
+    with pytest.raises(zoneinfo.ZoneInfoNotFoundError):
+        zoneinfo.ZoneInfo(zone)
+    assert zoneinfo.ZoneInfo("UTC") is utc, "zones cached before the block are the same objects after it"
 
 
 async def _assert_only_python_knows(zone: str, repo: ProgressionPacksRepository) -> None:
