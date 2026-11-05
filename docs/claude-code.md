@@ -32,26 +32,39 @@ The plugin's tools are named `mcp__plugin_embry0_embry0__<tool>`, and its MCP pr
 
 ### Connect the session
 
-Run this in your own terminal, not inside a Claude Code chat: a key typed in the chat is kept in its transcript.
+Run these in your own terminal, not inside a Claude Code chat: a key typed in the chat is kept in its transcript. They work in bash and zsh.
+
+First the dashboard origin and the key. At the empty prompt, paste the admin key and press Enter; nothing is shown:
 
 ```bash
-EMBRY0_URL=https://embry0.example.com          # the dashboard origin
-read -rs EMBRY0_API_KEY                        # paste the admin key; nothing is shown
-mkdir -p -m 700 ~/.config/embry0
-rm -f ~/.config/embry0/api-key                 # a new file, so the umask sets its mode
-(umask 077; printf '%s' "$EMBRY0_API_KEY" > ~/.config/embry0/api-key)
-unset EMBRY0_API_KEY
-HELPER="jq -Rs '{Authorization: (\"Bearer \" + .)}' $HOME/.config/embry0/api-key"
-claude mcp add-json --scope user embry0 "$(jq -n --arg url "$EMBRY0_URL/mcp" --arg helper "$HELPER" \
-  '{type: "http", url: $url, headersHelper: $helper}')"
-claude mcp list                                # embry0 should say connected
+EMBRY0_URL=https://embry0.example.com
+read -rs EMBRY0_API_KEY
 ```
 
-The key goes from `read` to a file only you can read, through `printf`, a shell builtin. No command gets it as an argument: while a command runs, every local user can read its arguments (`ps`, `/proc/<pid>/cmdline`). Claude Code's settings hold the `headersHelper` command, not the key; it runs that command each time it connects, and the command prints the header from the file. The key is not exported and is unset, so a Claude Code session started from this shell does not carry it in its environment, where a command the session runs could print it.
+Then write the key to a file only you can read, and add the server:
 
-`--scope user` makes the server available in every project; leave it out to add it to the current project only. When you no longer need the key, revoke it on the dashboard, then `claude mcp remove embry0` and delete `~/.config/embry0/api-key`.
+```bash
+mkdir -p ~/.config/embry0
+chmod 700 ~/.config/embry0
+rm -f ~/.config/embry0/api-key
+(umask 077; printf '%s' "$EMBRY0_API_KEY" > ~/.config/embry0/api-key)
+unset EMBRY0_API_KEY
+HELPER="jq -Rs '{Authorization: (\"Bearer \" + .)}' ~/.config/embry0/api-key"
+claude mcp remove --scope user embry0 2>/dev/null
+claude mcp add-json --scope user embry0 "$(jq -n --arg url "$EMBRY0_URL/mcp" --arg helper "$HELPER" \
+  '{type: "http", url: $url, headersHelper: $helper}')"
+claude mcp list
+```
 
-With the package installed (`pip install -e .` in a checkout), the same tools also run over stdio: run this instead of the `claude mcp add-json` line. The server reads the key from the same file each time Claude Code starts it:
+`claude mcp list` should say embry0 is connected.
+
+The key goes from `read` to the file through `printf`, a shell builtin, and the file is made new (`rm -f`) so the umask gives it mode 600. No command gets the key as an argument: while a command runs, every local user can read its arguments (`ps`, `/proc/<pid>/cmdline`). Claude Code's settings hold the `headersHelper` command, not the key; Claude Code runs that command each time it connects, and the command prints the header from the file. The key is not exported and is unset, so a Claude Code session started from this shell does not carry it in its environment, where a command the session runs could print it.
+
+The `remove` line drops an `embry0` entry an earlier connection left; with none, it prints nothing. An entry made by an earlier version of this page kept the key in Claude Code's settings: revoke that key on the dashboard.
+
+`--scope user` makes the server available in every project. To add it to the current project only, leave `--scope user` out of both lines; Claude Code then runs the helper only in a folder you trust, so start `claude` there once and accept the trust prompt. When you no longer need the key, revoke it on the dashboard, then `claude mcp remove embry0` and delete `~/.config/embry0/api-key`.
+
+With the package installed (`pip install -e .` in a checkout), the same tools also run over stdio: run this in place of the `claude mcp add-json` line. The server reads the key from the same file each time Claude Code starts it:
 
 ```bash
 claude mcp add --scope user embry0 --env EMBRY0_API_URL="$EMBRY0_URL" -- \
@@ -65,16 +78,14 @@ Then start `claude`, check `/mcp` lists embry0 with its tools, and type `/mcp__e
 No MCP tool takes a secret, by design. Add each credential on the dashboard (Infra, then Credentials), or with the API from your terminal, reading the secret from a file so it is never shown:
 
 ```bash
-read -rs EMBRY0_API_KEY                        # the admin key, as above
 jq -n --rawfile secret ./token.txt \
   '{kind: "forge_token", provider: "github", label: "acme-bot", secret: ($secret | rtrimstr("\n"))}' |
   curl -sS -X POST "$EMBRY0_URL/api/v1/credentials" \
-    -H @<(printf 'Authorization: Bearer %s\n' "$EMBRY0_API_KEY") -H "Content-Type: application/json" \
+    -H @<(jq -Rr '"Authorization: Bearer " + .' ~/.config/embry0/api-key) -H "Content-Type: application/json" \
     -H "X-Requested-With: XMLHttpRequest" --data-binary @-
-unset EMBRY0_API_KEY
 ```
 
-curl reads the header from a file (`-H @file`), here a pipe that `printf` fills, so neither the key nor the secret is an argument. This needs bash. The answer carries a masked preview, never the secret. Tell the session the label; it finds the id with `credential_list` and does the binding. [credentials.md](credentials.md) has every kind and field.
+It reads the key from the file of the manual connection above; with the plugin, write that file first with the lines of the second block up to `unset`. curl reads the header from a file (`-H @file`), here a pipe that `jq` fills, so neither the key nor the secret is an argument. This needs bash or zsh. The answer carries a masked preview, never the secret. Tell the session the label; it finds the id with `credential_list` and does the binding. [credentials.md](credentials.md) has every kind and field.
 
 | Credential | `kind` | What it needs |
 |---|---|---|
