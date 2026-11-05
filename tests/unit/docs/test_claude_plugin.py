@@ -219,33 +219,83 @@ def test_no_skill_takes_a_secret_in_the_chat() -> None:
         assert "transcript" in _skill(name), f"{name} does not say why"
 
 
-# Where a builtin may expand the key: ``printf`` at the start of a command whose output goes to a pipe, a
-# redirect or a process substitution ``<(...)``, never inside ``$(...)``, whose output becomes an argument.
-_BUILTIN_PRINTF = re.compile(r"(?:^|(?<!\$)\(|[;|&])\s*printf '[^']*' \"$")
-# The key file read into a command substitution: allowed only as the value of an assignment (the stdio wrapper).
-_KEY_FILE_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+_ASSIGNED_AT_COMMAND_START = re.compile(r"(?:^|[;&|(']|&&)\s*EMBRY0_API_KEY=$")
+
+
+def _key_file_in_a_substitution(line: str) -> str | None:
+    """The key file (``api-key``) read inside ``$(...)`` or backticks, whose output becomes an argument.
+
+    Quote-aware: single-quoted text is skipped, except a ``sh -c '...'`` script, checked as a line of its own.
+    Allowed only as the value of ``EMBRY0_API_KEY=`` at the start of a command (the stdio wrapper).
+    """
+    frames: list[tuple[str, int]] = []  # open "$(", "<(", "(" or "`", with where it starts
+    quote, i = "", 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'" and quote != '"':
+            end = line.find("'", i + 1)
+            end = len(line) if end == -1 else end
+            if re.search(r"\bsh -c $", line[:i]):
+                reason = _key_reaches_an_argument(line[i + 1 : end])
+                if reason:
+                    return reason
+            i = end + 1
+            continue
+        if c == '"':
+            quote = "" if quote else '"'
+        elif line.startswith("api-key", i):
+            outer = next((start for kind, start in frames if kind in ("$(", "`")), None)
+            if outer is not None and not _ASSIGNED_AT_COMMAND_START.search(line[:outer]):
+                return f"the key file is an argument: {line}"
+        elif line.startswith(("$(", "<("), i):
+            frames.append((line[i : i + 2], i))
+            i += 1
+        elif c == "(":
+            frames.append(("(", i))
+        elif c == ")" and frames:
+            frames.pop()
+        elif c == "`":
+            if frames and frames[-1][0] == "`":
+                frames.pop()
+            else:
+                frames.append(("`", i))
+        i += 1
+    return None
+
+
+def _key_reaches_an_argument(line: str) -> str | None:
+    """Why ``line`` would put the API key into a process's arguments, or None.
+
+    A key in a command's arguments shows in ps and /proc to every local user while it runs. Only
+    builtins may expand the key: ``printf '<format>' "$EMBRY0_API_KEY"`` at the start of a command,
+    writing to a file or into ``jq``, and ``[ -n "$EMBRY0_API_KEY" ]``. The key file may feed a pipe,
+    a process substitution or a headersHelper, never an argument (``$(...)``, backticks, xargs).
+    """
+    for match in re.finditer(r"\$\{?EMBRY0_API_KEY\b\}?", line):
+        before, after = line[: match.start()], line[match.end() :]
+        if re.search(r"(?:^|(?<!\$)\(|[;|&])\s*printf '[^']*' \"$", before) and re.match(r'"\s*(?:>|\|\s*jq\b)', after):
+            continue
+        if re.search(r"(?:^|[;|&])\s*\[ -n \"$", before) and re.match(r'" \]', after):
+            continue
+        return f"the key is an argument: {line}"
+    if "api-key" in line and re.search(r"\|\s*xargs\b", line):
+        return f"the key file feeds xargs: {line}"
+    return _key_file_in_a_substitution(line)
 
 
 def test_no_documented_command_puts_the_key_on_a_command_line() -> None:
-    """A key in a command's arguments shows in ps and /proc to every local user while it runs.
-
-    Only shell builtins may expand it: ``read`` and ``unset`` name it, and ``printf`` (a bash
-    builtin, no new process) writes it into a pipe or a file. The key file may be read into a
-    command substitution only as an assignment's value. The whole guide is covered, the manual
-    connection too, inline code as well as blocks.
-    """
+    """Every skill, the plugin README and the whole guide (the manual connection too, inline code as well as blocks)."""
     texts = [*(p.read_text() for p in SKILLS.glob("*/SKILL.md")), PLUGIN_README.read_text(), GUIDE.read_text()]
     expansions = 0
     for code in (c for text in texts for c in _code(text)):
         for line in code.splitlines():
-            for match in re.finditer(r"\$\{?EMBRY0_API_KEY\b", line):
-                expansions += 1
-                assert _BUILTIN_PRINTF.search(line[: match.start()]), f"the key is an argument: {line}"
-            for match in _KEY_FILE_SUBSTITUTION.finditer(line):
-                if "api-key" in (match.group(1) or match.group(2) or ""):
-                    before = line[: match.start()]
-                    assert re.search(r"[A-Za-z_][A-Za-z0-9_]*=$", before), f"the key file is an argument: {line}"
-    assert expansions >= 2, "a recipe no longer reads the key: update this test"
+            expansions += len(re.findall(r"\$\{?EMBRY0_API_KEY\b", line))
+            reason = _key_reaches_an_argument(line)
+            assert reason is None, reason
+    assert expansions >= 3, "a recipe no longer reads the key: update this test"
 
 
 @pytest.mark.parametrize(
@@ -255,18 +305,53 @@ def test_no_documented_command_puts_the_key_on_a_command_line() -> None:
         'curl -H "Authorization: Bearer $(cat ~/.config/embry0/api-key)" https://x',
         'curl -H "Authorization: Bearer `cat ~/.config/embry0/api-key`" https://x',
         'claude mcp add embry0 --header "Authorization: Bearer ${EMBRY0_API_KEY}"',
+        "claude mcp add embry0 --env EMBRY0_API_KEY=$(cat ~/.config/embry0/api-key) -- embry0-mcp",
+        "env EMBRY0_API_KEY=$(cat ~/.config/embry0/api-key) embry0-mcp",
+        'curl -H "$(jq -Rr \'("Authorization: Bearer " + .)\' ~/.config/embry0/api-key)" https://x',
+        "printf '%s' \"$EMBRY0_API_KEY\" | xargs -I{} curl -H 'Authorization: Bearer {}' https://x",
+        "cat ~/.config/embry0/api-key | xargs -I{} curl -H 'Authorization: Bearer {}' https://x",
+        "sh -c 'curl -H \"Authorization: Bearer $(cat ~/.config/embry0/api-key)\" https://x'",
+        'K=$(cat ~/.config/embry0/api-key); curl -H "Authorization: Bearer $K" https://x',
     ],
-    ids=["printf inside $()", "the key file inside $()", "the key file in backticks", "a plain expansion"],
+    ids=[
+        "printf inside $()",
+        "the key file inside $()",
+        "the key file in backticks",
+        "a plain expansion",
+        "an option's value",
+        "an env argument",
+        "parentheses inside $()",
+        "printf into xargs",
+        "the key file into xargs",
+        "inside an sh -c script",
+        "another variable",
+    ],
 )
 def test_the_command_line_check_refuses_each_form(line: str) -> None:
-    """The check above, shown able to fail on each way a key reaches an argument."""
-    printf_ok = all(_BUILTIN_PRINTF.search(line[: m.start()]) for m in re.finditer(r"\$\{?EMBRY0_API_KEY\b", line))
-    file_ok = all(
-        re.search(r"[A-Za-z_][A-Za-z0-9_]*=$", line[: m.start()])
-        for m in _KEY_FILE_SUBSTITUTION.finditer(line)
-        if "api-key" in (m.group(1) or m.group(2) or "")
-    )
-    assert not (printf_ok and file_ok), f"the check lets this through: {line}"
+    assert _key_reaches_an_argument(line) is not None, f"the check lets this through: {line}"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "(umask 077; printf '%s' \"$EMBRY0_API_KEY\" > ~/.config/embry0/api-key)",
+        "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs '{api_key: .}' |",
+        '[ -n "$EMBRY0_API_KEY" ] && rm -f ~/.config/embry0/api-key',
+        'HELPER="jq -Rs \'{Authorization: (\\"Bearer \\" + .)}\' ~/.config/embry0/api-key"',
+        "  sh -c 'EMBRY0_API_KEY=$(cat ~/.config/embry0/api-key); export EMBRY0_API_KEY; exec embry0-mcp'",
+        '    -H @<(jq -Rr \'"Authorization: Bearer " + .\' ~/.config/embry0/api-key) -H "Content-Type: application/json" \\',
+    ],
+    ids=[
+        "printf to a file",
+        "printf into jq",
+        "a test builtin",
+        "a helper string",
+        "the stdio wrapper",
+        "a process substitution",
+    ],
+)
+def test_the_command_line_check_allows_the_documented_forms(line: str) -> None:
+    assert _key_reaches_an_argument(line) is None
 
 
 def test_the_guide_blocks_carry_no_comments() -> None:
@@ -366,6 +451,17 @@ def test_the_manual_connection_keeps_the_key_in_a_private_file(
     # Claude Code runs the helper through a shell each time it connects; it prints the header.
     helper = subprocess.run(["sh", "-c", config["headersHelper"]], env=env, capture_output=True, text=True, check=True)
     assert json.loads(helper.stdout) == {"Authorization": f"Bearer {key}"}
+
+
+def test_the_second_block_alone_keeps_a_saved_key(stand_ins: tuple[dict[str, str], Path, Path]) -> None:
+    """Run in a shell where the first block did not run, the key block must not empty the saved file."""
+    env, _, home = stand_ins
+    _key_file(home).parent.mkdir(parents=True, mode=0o700)
+    _key_file(home).write_text("the saved key")
+    _key_file(home).chmod(0o600)
+    _run_recipe(_guide_recipe("headersHelper"), {**env, "EMBRY0_URL": GUIDE_URL})
+    assert _key_file(home).read_text() == "the saved key"
+    assert stat.S_IMODE(_key_file(home).stat().st_mode) == 0o600
 
 
 def test_the_stdio_connection_reads_the_key_from_the_file_when_it_starts(

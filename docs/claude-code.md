@@ -46,8 +46,7 @@ Then write the key to a file only you can read, and add the server:
 ```bash
 mkdir -p ~/.config/embry0
 chmod 700 ~/.config/embry0
-rm -f ~/.config/embry0/api-key
-(umask 077; printf '%s' "$EMBRY0_API_KEY" > ~/.config/embry0/api-key)
+[ -n "$EMBRY0_API_KEY" ] && rm -f ~/.config/embry0/api-key && (umask 077; printf '%s' "$EMBRY0_API_KEY" > ~/.config/embry0/api-key)
 unset EMBRY0_API_KEY
 HELPER="jq -Rs '{Authorization: (\"Bearer \" + .)}' ~/.config/embry0/api-key"
 claude mcp remove --scope user embry0 2>/dev/null
@@ -58,11 +57,11 @@ claude mcp list
 
 `claude mcp list` should say embry0 is connected.
 
-The key goes from `read` to the file through `printf`, a shell builtin, and the file is made new (`rm -f`) so the umask gives it mode 600. No command gets the key as an argument: while a command runs, every local user can read its arguments (`ps`, `/proc/<pid>/cmdline`). Claude Code's settings hold the `headersHelper` command, not the key; Claude Code runs that command each time it connects, and the command prints the header from the file. The key is not exported and is unset, so a Claude Code session started from this shell does not carry it in its environment, where a command the session runs could print it.
+The key goes from `read` to the file through `printf`, a shell builtin, and the file is made new (`rm -f`) so the umask gives it mode 600. With no key read (the first block not run in this shell), that line writes nothing and a saved key file stays as it is. No command gets the key as an argument: while a command runs, every local user can read its arguments (`ps`, `/proc/<pid>/cmdline`). Claude Code's settings hold the `headersHelper` command, not the key; Claude Code runs that command each time it connects, and the command prints the header from the file. The key is not exported and is unset, so a Claude Code session started from this shell does not carry it in its environment, where a command the session runs could print it.
 
-The `remove` line drops an `embry0` entry an earlier connection left; with none, it prints nothing. An entry made by an earlier version of this page kept the key in Claude Code's settings: revoke that key on the dashboard.
+The `remove` line drops a user-scope `embry0` entry an earlier connection left; with none, it prints nothing. An entry made by an earlier version of this page kept the key in Claude Code's settings: revoke that key on the dashboard. If that page added embry0 to one project only, its entry hides the new one in that project: run `claude mcp remove --scope local embry0` in that project's folder.
 
-`--scope user` makes the server available in every project. To add it to the current project only, leave `--scope user` out of both lines; Claude Code then runs the helper only in a folder you trust, so start `claude` there once and accept the trust prompt. When you no longer need the key, revoke it on the dashboard, then `claude mcp remove embry0` and delete `~/.config/embry0/api-key`.
+`--scope user` makes the server available in every project. To add it to the current project only, use `--scope local` in place of `--scope user` in both lines; Claude Code then runs the helper only in a folder you trust, so start `claude` there once and accept the trust prompt. When you no longer need the key, revoke it on the dashboard, then `claude mcp remove embry0` and delete `~/.config/embry0/api-key`.
 
 With the package installed (`pip install -e .` in a checkout), the same tools also run over stdio: run this in place of the `claude mcp add-json` line. The server reads the key from the same file each time Claude Code starts it:
 
@@ -85,7 +84,7 @@ jq -n --rawfile secret ./token.txt \
     -H "X-Requested-With: XMLHttpRequest" --data-binary @-
 ```
 
-It reads the key from the file of the manual connection above; with the plugin, write that file first with the lines of the second block up to `unset`. curl reads the header from a file (`-H @file`), here a pipe that `jq` fills, so neither the key nor the secret is an argument. This needs bash or zsh. The answer carries a masked preview, never the secret. Tell the session the label; it finds the id with `credential_list` and does the binding. [credentials.md](credentials.md) has every kind and field.
+It reads the key from the file of the manual connection above. With the plugin, write that file first: the first block, then the second block up to `unset`. curl reads the header from a file (`-H @file`), here a pipe that `jq` fills, so neither the key nor the secret is an argument. This needs bash or zsh. The answer carries a masked preview, never the secret. Tell the session the label; it finds the id with `credential_list` and does the binding. [credentials.md](credentials.md) has every kind and field.
 
 | Credential | `kind` | What it needs |
 |---|---|---|
