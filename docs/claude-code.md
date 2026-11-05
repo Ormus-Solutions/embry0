@@ -27,8 +27,8 @@ The plugin's tools are named `mcp__plugin_embry0_embry0__<tool>`, and its MCP pr
 ### What you need
 
 - A running deployment you can reach. The MCP endpoint is `/mcp` on the dashboard's origin.
-- An API key with the admin tier. Make one on the dashboard under Settings, then API keys, with the scope `admin`. The tab shows the `claude mcp add` command for the new key.
-- Claude Code.
+- An API key with the admin tier. Make one on the dashboard under Settings, then API keys, with the scope `admin`, and copy the key. Do not run the `claude mcp add` command the tab shows: it puts the key on a command line.
+- Claude Code and `jq`.
 
 ### Connect the session
 
@@ -37,17 +37,26 @@ Run this in your own terminal, not inside a Claude Code chat: a key typed in the
 ```bash
 EMBRY0_URL=https://embry0.example.com          # the dashboard origin
 read -rs EMBRY0_API_KEY                        # paste the admin key; nothing is shown
-claude mcp add --scope user --transport http embry0 "$EMBRY0_URL/mcp" \
-  --header "Authorization: Bearer $EMBRY0_API_KEY"
+mkdir -p -m 700 ~/.config/embry0
+rm -f ~/.config/embry0/api-key                 # a new file, so the umask sets its mode
+(umask 077; printf '%s' "$EMBRY0_API_KEY" > ~/.config/embry0/api-key)
 unset EMBRY0_API_KEY
+HELPER="jq -Rs '{Authorization: (\"Bearer \" + .)}' $HOME/.config/embry0/api-key"
+claude mcp add-json --scope user embry0 "$(jq -n --arg url "$EMBRY0_URL/mcp" --arg helper "$HELPER" \
+  '{type: "http", url: $url, headersHelper: $helper}')"
 claude mcp list                                # embry0 should say connected
 ```
 
-The key is not exported and is unset after the add, so a Claude Code session started from this shell does not carry it in its environment, where a command the session runs could print it.
+The key goes from `read` to a file only you can read, through `printf`, a shell builtin. No command gets it as an argument: while a command runs, every local user can read its arguments (`ps`, `/proc/<pid>/cmdline`). Claude Code's settings hold the `headersHelper` command, not the key; it runs that command each time it connects, and the command prints the header from the file. The key is not exported and is unset, so a Claude Code session started from this shell does not carry it in its environment, where a command the session runs could print it.
 
-`--scope user` makes the server available in every project; leave it out to add it to the current project only. Claude Code keeps the header in its own settings file, so treat that file as a secret and revoke the key on the dashboard when you no longer need it (`claude mcp remove embry0` removes the server).
+`--scope user` makes the server available in every project; leave it out to add it to the current project only. When you no longer need the key, revoke it on the dashboard, then `claude mcp remove embry0` and delete `~/.config/embry0/api-key`.
 
-With the package installed (`pip install -e .` in a checkout), the same tools also run over stdio: `claude mcp add embry0 --env EMBRY0_API_URL="$EMBRY0_URL" --env EMBRY0_API_KEY="$EMBRY0_API_KEY" -- embry0-mcp`, run before the `unset`.
+With the package installed (`pip install -e .` in a checkout), the same tools also run over stdio: run this instead of the `claude mcp add-json` line. The server reads the key from the same file each time Claude Code starts it:
+
+```bash
+claude mcp add --scope user embry0 --env EMBRY0_API_URL="$EMBRY0_URL" -- \
+  sh -c 'EMBRY0_API_KEY=$(cat ~/.config/embry0/api-key); export EMBRY0_API_KEY; exec embry0-mcp'
+```
 
 Then start `claude`, check `/mcp` lists embry0 with its tools, and type `/mcp__embry0__setup`. That prompt gives the session the whole procedure below. Say what you want set up, for example "set up the GitHub organization acme".
 
@@ -56,14 +65,16 @@ Then start `claude`, check `/mcp` lists embry0 with its tools, and type `/mcp__e
 No MCP tool takes a secret, by design. Add each credential on the dashboard (Infra, then Credentials), or with the API from your terminal, reading the secret from a file so it is never shown:
 
 ```bash
+read -rs EMBRY0_API_KEY                        # the admin key, as above
 jq -n --rawfile secret ./token.txt \
   '{kind: "forge_token", provider: "github", label: "acme-bot", secret: ($secret | rtrimstr("\n"))}' |
   curl -sS -X POST "$EMBRY0_URL/api/v1/credentials" \
-    -H "Authorization: Bearer $EMBRY0_API_KEY" -H "Content-Type: application/json" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$EMBRY0_API_KEY") -H "Content-Type: application/json" \
     -H "X-Requested-With: XMLHttpRequest" --data-binary @-
+unset EMBRY0_API_KEY
 ```
 
-Run it with `EMBRY0_API_KEY` read the same way as above, then unset it. The answer carries a masked preview, never the secret. Tell the session the label; it finds the id with `credential_list` and does the binding. [credentials.md](credentials.md) has every kind and field.
+curl reads the header from a file (`-H @file`), here a pipe that `printf` fills, so neither the key nor the secret is an argument. This needs bash. The answer carries a masked preview, never the secret. Tell the session the label; it finds the id with `credential_list` and does the binding. [credentials.md](credentials.md) has every kind and field.
 
 | Credential | `kind` | What it needs |
 |---|---|---|

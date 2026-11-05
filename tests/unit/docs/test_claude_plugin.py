@@ -7,7 +7,9 @@ behind the prompt. These tests pin each of those, and run the install skill's
 four scripts for real: the network check, the one that writes ``.env``, the
 ready check and the one that mints the plugin's API key and hands it to the
 plugin's options (against a local stand-in for the deployment and a stand-in
-``claude``). The connect skill's terminal recipe runs for real too.
+``claude``). The connect skill's terminal recipe runs for real too, and so do the
+guide's manual recipes (the HTTP and stdio connections and the credential upload),
+which must keep the API key off every command line.
 """
 
 from __future__ import annotations
@@ -78,6 +80,19 @@ def _install_script(marker: str) -> str:
 
 def _bash_blocks(text: str) -> list[str]:
     return re.findall(r"```bash\n(.*?)\n```", text, flags=re.S)
+
+
+def _code(text: str) -> list[str]:
+    """Every bash block of a page and every inline code span outside them."""
+    prose = re.sub(r"```.*?```", "", text, flags=re.S)
+    return [*_bash_blocks(text), *re.findall(r"`([^`\n]+)`", prose)]
+
+
+def _guide_recipe(marker: str) -> str:
+    """The one bash block of the guide that contains ``marker``."""
+    found = [block for block in _bash_blocks(GUIDE.read_text()) if marker in block]
+    assert len(found) == 1, f"{len(found)} guide recipes contain {marker!r}"
+    return found[0]
 
 
 def _tool_prefix() -> str:
@@ -204,21 +219,146 @@ def test_no_skill_takes_a_secret_in_the_chat() -> None:
         assert "transcript" in _skill(name), f"{name} does not say why"
 
 
-def test_no_plugin_command_puts_the_key_on_a_command_line() -> None:
+def test_no_documented_command_puts_the_key_on_a_command_line() -> None:
     """A key in a command's arguments shows in ps and /proc to every local user while it runs.
 
     Only shell builtins may expand it: ``read`` and ``unset`` name it, and ``printf`` (a bash
-    builtin, no new process) writes it into a pipe.
+    builtin, no new process) writes it into a pipe or a file. The whole guide is covered, the
+    manual connection too, inline code as well as blocks.
     """
-    texts = [*(p.read_text() for p in SKILLS.glob("*/SKILL.md")), PLUGIN_README.read_text()]
-    texts.append(GUIDE.read_text().split("## Connect without the plugin", 1)[0])
+    texts = [*(p.read_text() for p in SKILLS.glob("*/SKILL.md")), PLUGIN_README.read_text(), GUIDE.read_text()]
     expansions = 0
-    for block in (b for text in texts for b in _bash_blocks(text)):
-        for line in block.splitlines():
+    for code in (c for text in texts for c in _code(text)):
+        for line in code.splitlines():
             for match in re.finditer(r"\$\{?EMBRY0_API_KEY\b", line):
                 expansions += 1
-                assert line[: match.start()].endswith("printf '%s' \""), f"the key is an argument: {line}"
-    assert expansions >= 1, "the terminal recipe no longer reads the key: update this test"
+                assert re.search(r"printf '[^']*' \"$", line[: match.start()]), f"the key is an argument: {line}"
+    assert expansions >= 3, "a recipe no longer reads the key: update this test"
+
+
+GUIDE_URL = "https://embry0.example.com"
+
+
+@pytest.fixture
+def stand_ins(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
+    """``claude``, ``curl`` and ``embry0-mcp`` on PATH that record each call, in a home of their own.
+
+    A call records its arguments, the key in its environment (only ``embry0-mcp`` may have it),
+    and for curl the header files it is given (``-H @file``) and its stdin.
+    """
+    if shutil.which("jq") is None:
+        pytest.skip("jq is not installed")
+    bin_dir, home = tmp_path / "bin", tmp_path / "home"
+    bin_dir.mkdir()
+    home.mkdir()
+    calls = tmp_path / "calls.jsonl"
+    body = (
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        "name, args = os.path.basename(sys.argv[0]), sys.argv[1:]\n"
+        "call = {'name': name, 'args': args, 'key': os.environ.get('EMBRY0_API_KEY')}\n"
+        "if name == 'curl':\n"
+        "    call['headers'] = [open(b[1:]).read() for a, b in zip(args, args[1:]) if a == '-H' and b[:1] == '@']\n"
+        "    call['stdin'] = sys.stdin.read()\n"
+        f"open({str(calls)!r}, 'a').write(json.dumps(call) + '\\n')\n"
+    )
+    for name in ("claude", "curl", "embry0-mcp"):
+        (bin_dir / name).write_text(body)
+        (bin_dir / name).chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if k != "EMBRY0_API_KEY"}
+    return {**env, "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}", "HOME": str(home)}, calls, home
+
+
+def _run_recipe(
+    recipe: str, env: dict[str, str], key: str, cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """A guide recipe, run by bash as written, with the key typed at its ``read`` (on stdin)."""
+    assert recipe.count("read -rs EMBRY0_API_KEY") == 1, "the recipe no longer reads the key"
+    run = subprocess.run(
+        ["bash", "-c", recipe], env=env, input=key + "\n", cwd=cwd, capture_output=True, text=True, check=False
+    )
+    assert run.returncode == 0, run.stderr
+    assert key not in run.stdout + run.stderr
+    return run
+
+
+@pytest.mark.parametrize("older_file", [False, True], ids=["a new home", "an older key file"])
+def test_the_manual_connection_keeps_the_key_in_a_private_file(
+    stand_ins: tuple[dict[str, str], Path, Path], older_file: bool
+) -> None:
+    env, calls, home = stand_ins
+    key_file = home / ".config" / "embry0" / "api-key"
+    if older_file:  # an earlier run, or a file made by hand with the default umask
+        key_file.parent.mkdir(parents=True, mode=0o700)
+        key_file.write_text("an older key")
+        key_file.chmod(0o644)
+    key = "canary-manual-key"
+    _run_recipe(_guide_recipe("headersHelper"), env, key)
+
+    assert key_file.read_text() == key
+    assert stat.S_IMODE(key_file.stat().st_mode) == 0o600, "the key file is readable by others"
+    assert stat.S_IMODE(key_file.parent.stat().st_mode) == 0o700
+    add, listed = _calls(calls)
+    for call in (add, listed):
+        assert call["name"] == "claude"
+        assert key not in json.dumps(call["args"]), f"the key is an argument: {call['args']}"
+        assert call["key"] is None, "claude runs with the key in its environment"
+    assert listed["args"] == ["mcp", "list"]
+    assert add["args"][:5] == ["mcp", "add-json", "--scope", "user", "embry0"]
+    config = json.loads(add["args"][5])
+    assert {k: v for k, v in config.items() if k != "headersHelper"} == {"type": "http", "url": f"{GUIDE_URL}/mcp"}
+    # Claude Code runs the helper through a shell each time it connects; it prints the header.
+    helper = subprocess.run(["sh", "-c", config["headersHelper"]], env=env, capture_output=True, text=True, check=True)
+    assert json.loads(helper.stdout) == {"Authorization": f"Bearer {key}"}
+
+
+def test_the_stdio_connection_reads_the_key_from_the_file_when_it_starts(
+    stand_ins: tuple[dict[str, str], Path, Path],
+) -> None:
+    env, calls, home = stand_ins
+    key = "canary-stdio-key"
+    key_file = home / ".config" / "embry0" / "api-key"
+    key_file.parent.mkdir(parents=True, mode=0o700)
+    key_file.write_text(key)
+    recipe = _guide_recipe("embry0-mcp")
+    run = subprocess.run(
+        ["bash", "-c", recipe], env={**env, "EMBRY0_URL": GUIDE_URL}, capture_output=True, text=True, check=False
+    )
+    assert run.returncode == 0, run.stderr
+    (add,) = _calls(calls)
+    assert key not in json.dumps(add["args"])
+    sep = add["args"].index("--")
+    assert add["args"][:sep] == ["mcp", "add", "--scope", "user", "embry0", "--env", f"EMBRY0_API_URL={GUIDE_URL}"]
+    command = add["args"][sep + 1 :]
+    assert command[:2] == ["sh", "-c"] and len(command) == 3
+    calls.unlink()
+    # Claude Code starts the server as that command, with no shell of its own around it.
+    subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+    (server,) = _calls(calls)
+    assert server["name"] == "embry0-mcp"
+    assert server["args"] == []
+    assert server["key"] == key, "the server did not get the key from the file"
+
+
+def test_the_credential_upload_sends_the_key_and_the_secret_through_files(
+    stand_ins: tuple[dict[str, str], Path, Path], tmp_path: Path
+) -> None:
+    env, calls, _ = stand_ins
+    key, secret = "canary-upload-key", "canary-forge-secret"
+    (tmp_path / "token.txt").write_text(secret + "\n")
+    _run_recipe(_guide_recipe("/api/v1/credentials"), {**env, "EMBRY0_URL": GUIDE_URL}, key, cwd=tmp_path)
+    (curl,) = _calls(calls)
+    assert curl["name"] == "curl"
+    assert key not in json.dumps(curl["args"]) and secret not in json.dumps(curl["args"])
+    assert curl["key"] is None
+    assert f"{GUIDE_URL}/api/v1/credentials" in curl["args"]
+    assert f"Authorization: Bearer {key}\n" in curl["headers"]
+    assert json.loads(curl["stdin"]) == {
+        "kind": "forge_token",
+        "provider": "github",
+        "label": "acme-bot",
+        "secret": secret,
+    }
 
 
 def _fake_claude(tmp_path: Path, fail: str | None = None) -> tuple[dict[str, str], Path]:
