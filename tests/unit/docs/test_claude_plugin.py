@@ -219,28 +219,38 @@ def test_no_skill_takes_a_secret_in_the_chat() -> None:
         assert "transcript" in _skill(name), f"{name} does not say why"
 
 
-# Every form in which a documented command may touch the API key or its file. A line that names the key
-# (``$EMBRY0_API_KEY``, ``EMBRY0_API_KEY=``) or the key file in any other form fails: shell has too many ways to
-# turn a value into an argument for a deny-list to catch, so a new recipe that handles the key is added here, on
-# purpose, after a review. A key in a command's arguments shows in ps and /proc to every local user.
-_KEY_FORMS = [
-    r"read -rs EMBRY0_API_KEY",
-    r"unset EMBRY0_API_KEY",
-    r'\[ -n "\$EMBRY0_API_KEY" \]',
-    # printf is a builtin: no process gets the key; it writes into a file or into jq's stdin.
-    r"printf '%s' \"\$EMBRY0_API_KEY\" (?:> ~/\.config/embry0/api-key|\| jq -Rs )",
-    r"rm -f ~/\.config/embry0/api-key",
-    # The helper string names the file; Claude Code runs it and reads the header from its stdout.
-    r"HELPER=\"jq -Rs '\{Authorization: \(\\\"Bearer \\\" \+ \.\)\}' ~/\.config/embry0/api-key\"",
-    # The stdio wrapper: the key goes into the server's own environment, never an argument.
-    r"sh -c 'EMBRY0_API_KEY=\$\(cat ~/\.config/embry0/api-key\); export EMBRY0_API_KEY; exec embry0-mcp'",
-    # curl reads the header from a file descriptor that jq fills.
-    r"-H @<\(jq -Rr '\"Authorization: Bearer \" \+ \.' ~/\.config/embry0/api-key\)",
-    r"^~/\.config/embry0/api-key$",  # the path alone, in prose
-]
-_KEY_MENTION = re.compile(r"EMBRY0_API_KEY|api-key")
-# Even an allowed form must not hand what it reads to something that makes arguments or code of it.
-_KEY_TO_ARGUMENTS = re.compile(r"\bxargs\b|\|\s*(?:sh|bash|zsh|dash)\b|\beval\b")
+# Every documented command line that touches the API key, its file or the helper that reads it, exactly as the
+# pages write it (whitespace collapsed). Any other line that names one of them fails: shell has too many ways to turn
+# a value into an argument (``$(...)``, ``env``, ``exec``, ``xargs``, ``awk``, a pipe into a shell...) for a pattern
+# to tell safe from unsafe, so a new recipe that handles the key is added here, on purpose, after a review. A key in
+# a command's arguments shows in ps and /proc to every local user. Each line is safe as written: ``read``, ``unset``,
+# ``[`` and ``printf`` are builtins; the helper and ``<(...)`` hand the header over stdout; the stdio wrapper puts the
+# key in the server's own environment.
+_ADD_JSON = (
+    'claude mcp add-json --scope {scope} embry0 "$(jq -n --arg url "$EMBRY0_URL/mcp" --arg helper "$HELPER" '
+    '\'{{type: "http", url: $url, headersHelper: $helper}}\')"'
+)
+_KEY_LINES = {
+    "read -rs EMBRY0_API_KEY",
+    "unset EMBRY0_API_KEY",
+    "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs --arg url \"https://embry0.example.com\" '{url: $url, api_key: .}' | "
+    "claude plugin configure embry0@embry0 --values-stdin",
+    '[ -n "$EMBRY0_API_KEY" ] && rm -f ~/.config/embry0/api-key && '
+    "(umask 077; printf '%s' \"$EMBRY0_API_KEY\" > ~/.config/embry0/api-key)",
+    'HELPER="jq -Rs \'{Authorization: (\\"Bearer \\" + .)}\' ~/.config/embry0/api-key"',
+    _ADD_JSON.format(scope="user"),
+    _ADD_JSON.format(scope="local"),  # the project-only variant the guide describes in prose
+    'claude mcp add --scope user embry0 --env EMBRY0_API_URL="$EMBRY0_URL" -- '
+    "sh -c 'EMBRY0_API_KEY=$(cat ~/.config/embry0/api-key); export EMBRY0_API_KEY; exec embry0-mcp'",
+    "jq -n --rawfile secret ./token.txt "
+    '\'{kind: "forge_token", provider: "github", label: "acme-bot", secret: ($secret | rtrimstr("\\n"))}\' | '
+    'curl -sS -X POST "$EMBRY0_URL/api/v1/credentials" '
+    "-H @<(jq -Rr '\"Authorization: Bearer \" + .' ~/.config/embry0/api-key) "
+    '-H "Content-Type: application/json" -H "X-Requested-With: XMLHttpRequest" --data-binary @-',
+    "~/.config/embry0/api-key",  # the path alone, in prose
+    "EMBRY0_API_KEY",  # the variable's name alone, in prose
+}
+_KEY_MENTION = re.compile(r"EMBRY0_API_KEY|api-key|HELPER")
 
 
 def _logical_lines(code: str) -> list[str]:
@@ -263,30 +273,33 @@ def _logical_lines(code: str) -> list[str]:
 
 
 def _key_reaches_an_argument(line: str) -> str | None:
-    """Why a logical line would put the API key into a process's arguments, or None."""
-    if not _KEY_MENTION.search(line):
+    """Why a logical line is not one of the documented lines that may touch the key, or None."""
+    if not _KEY_MENTION.search(line) or " ".join(line.split()) in _KEY_LINES:
         return None
-    rest = line
-    for form in _KEY_FORMS:
-        rest = re.sub(form, "", rest)
-    if _KEY_MENTION.search(rest):
-        return f"the key or its file in a form the docs do not allow: {line}"
-    found = _KEY_TO_ARGUMENTS.search(line)
-    if found:
-        return f"the key may reach arguments through {found.group(0)!r}: {line}"
-    return None
+    return f"a line that touches the key is not one of the reviewed lines: {line}"
+
+
+def _documented_lines() -> list[str]:
+    texts = [*(p.read_text() for p in SKILLS.glob("*/SKILL.md")), PLUGIN_README.read_text(), GUIDE.read_text()]
+    return [line for text in texts for code in _code(text) for line in _logical_lines(code)]
 
 
 def test_no_documented_command_puts_the_key_on_a_command_line() -> None:
     """Every skill, the plugin README and the whole guide (the manual connection too, inline code as well as blocks)."""
-    texts = [*(p.read_text() for p in SKILLS.glob("*/SKILL.md")), PLUGIN_README.read_text(), GUIDE.read_text()]
-    expansions = 0
-    for code in (c for text in texts for c in _code(text)):
-        for line in _logical_lines(code):
-            expansions += len(re.findall(r"\$\{?EMBRY0_API_KEY\b", line))
-            reason = _key_reaches_an_argument(line)
-            assert reason is None, reason
-    assert expansions >= 3, "a recipe no longer reads the key: update this test"
+    lines = _documented_lines()
+    for line in lines:
+        reason = _key_reaches_an_argument(line)
+        assert reason is None, reason
+    assert sum(len(re.findall(r"\$\{?EMBRY0_API_KEY\b", line)) for line in lines) >= 3, (
+        "a recipe no longer reads the key"
+    )
+
+
+def test_every_reviewed_key_line_is_still_documented() -> None:
+    """A listed line no page uses any more is an opening nobody reviews: remove it with the recipe."""
+    used = {" ".join(line.split()) for line in _documented_lines()}
+    prose_only = {_ADD_JSON.format(scope="local"), "EMBRY0_API_KEY"}  # described in prose, not written as a block
+    assert sorted(_KEY_LINES - used - prose_only) == []
 
 
 @pytest.mark.parametrize(
@@ -311,6 +324,15 @@ def test_no_documented_command_puts_the_key_on_a_command_line() -> None:
         "sh -c 'curl -H \"Authorization: Bearer $(cat ~/.config/embry0/api-key)\" https://x'",
         "bash -c 'curl -H \"Authorization: Bearer $(cat ~/.config/embry0/api-key)\" https://x'",
         "sh -ec 'curl -H \"Authorization: Bearer $(cat ~/.config/embry0/api-key)\" https://x'",
+        "curl -d \"$(printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs '{api_key: .}')\" https://x",
+        'printf \'%s\' "$EMBRY0_API_KEY" | jq -Rs -r . | while read -r k; do curl -H "Bearer $k" https://x; done',
+        "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs -r . | awk '{system(\"curl -H Bearer:\" $0)}'",
+        "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs -r '\"curl -H Bearer:\" + .' | /bin/sh",
+        'curl -H "$(sh -c "$HELPER" | jq -r \'"Authorization: " + .Authorization\')" https://x',
+        "env printf '%s' \"$EMBRY0_API_KEY\" > ~/.config/embry0/api-key",
+        "(umask 077; exec printf '%s' \"$EMBRY0_API_KEY\" > ~/.config/embry0/api-key)",
+        'env [ -n "$EMBRY0_API_KEY" ] && echo set',
+        "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs --arg k \"$(cat)\" -n '$k'",
     ],
     ids=[
         "printf inside $()",
@@ -332,34 +354,20 @@ def test_no_documented_command_puts_the_key_on_a_command_line() -> None:
         "an sh -c script",
         "a bash -c script",
         "an sh -ec script",
+        "an allowed form inside $()",
+        "a while loop after jq",
+        "awk system after jq",
+        "a pipe into /bin/sh",
+        "the helper run by hand",
+        "env printf",
+        "exec printf",
+        "env [",
+        "jq reading the key into its arguments",
     ],
 )
 def test_the_command_line_check_refuses_each_form(code: str) -> None:
     reasons = [r for r in map(_key_reaches_an_argument, _logical_lines(code)) if r]
     assert reasons, f"the check lets this through: {code}"
-
-
-@pytest.mark.parametrize(
-    "code",
-    [
-        "(umask 077; printf '%s' \"$EMBRY0_API_KEY\" > ~/.config/embry0/api-key)",
-        "printf '%s' \"$EMBRY0_API_KEY\" | jq -Rs '{api_key: .}' |\n  claude plugin configure embry0@embry0 --values-stdin",
-        '[ -n "$EMBRY0_API_KEY" ] && rm -f ~/.config/embry0/api-key',
-        'HELPER="jq -Rs \'{Authorization: (\\"Bearer \\" + .)}\' ~/.config/embry0/api-key"',
-        "claude mcp add embry0 -- \\\n  sh -c 'EMBRY0_API_KEY=$(cat ~/.config/embry0/api-key); export EMBRY0_API_KEY; exec embry0-mcp'",
-        'curl -sS https://x \\\n    -H @<(jq -Rr \'"Authorization: Bearer " + .\' ~/.config/embry0/api-key) -H "Accept: */*"',
-    ],
-    ids=[
-        "printf to a file",
-        "printf into jq",
-        "a test builtin",
-        "a helper string",
-        "the stdio wrapper",
-        "a process substitution",
-    ],
-)
-def test_the_command_line_check_allows_the_documented_forms(code: str) -> None:
-    assert [_key_reaches_an_argument(line) for line in _logical_lines(code)] == [None] * len(_logical_lines(code))
 
 
 def test_the_guide_blocks_carry_no_comments() -> None:
