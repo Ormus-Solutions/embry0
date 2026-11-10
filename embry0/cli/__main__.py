@@ -370,12 +370,29 @@ def cmd_config(args: argparse.Namespace) -> None:
         sys.exit(0)
 
 
+def prod_base_url(prod_port: str | None) -> str:
+    """The base URL of a stack published at PROD_PORT.
+
+    PROD_PORT is the compose file's published-ports value
+    (``"${PROD_PORT:-8200}:80"``), so it may carry a bind address:
+    ``127.0.0.1:8200`` publishes the dashboard on loopback only, which is how a
+    stack reached through a tunnel is run. Read as a bare port it builds
+    ``http://localhost:127.0.0.1:8200/``, which answers nothing (#1). A
+    wildcard bind is not an address to dial, so it becomes localhost.
+    """
+    published = (prod_port or "").strip() or "8200"
+    host, _, port = published.rpartition(":")
+    if host in ("", "0.0.0.0", "[::]"):
+        host = "localhost"
+    return f"http://{host}:{port or '8200'}"
+
+
 def cmd_health(args: argparse.Namespace) -> None:
     """Check the health of a running embry0 instance."""
     import httpx
 
-    port = os.environ.get("PROD_PORT", "8200")
-    url = args.url or os.environ.get("EMBRY0_URL", f"http://localhost:{port}")
+    default_url = prod_base_url(os.environ.get("PROD_PORT"))
+    url = args.url or os.environ.get("EMBRY0_URL") or default_url
     endpoint = f"{url.rstrip('/')}/api/v1/health/ready"
 
     try:
@@ -950,7 +967,7 @@ def main() -> None:
         "--url",
         type=str,
         default=None,
-        help="Base URL (default: EMBRY0_URL env or http://localhost:$PROD_PORT)",
+        help="Base URL (default: EMBRY0_URL env, or PROD_PORT's bind address and port)",
     )
 
     # config

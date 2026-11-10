@@ -31,8 +31,16 @@ esac
 """,
     # The running-jobs query answers with STUB_JOBS_BODY and the status in
     # STUB_JOBS_HTTP (000: nothing listening); every other URL is healthy.
+    # Only STUB_API_BASE answers at all: a query aimed anywhere else is a
+    # connection that never opens, which is what curl does with a URL built
+    # from a PROD_PORT read as a bare port (#1).
     "curl": """#!/bin/sh
 echo "curl $*" >> "$STUB_LOG"
+case "$*" in
+  *"${STUB_API_BASE:-http://localhost:8200}/"*) ;;
+  *) case "$*" in *"%{http_code}"*) printf '\\n000' ;; esac
+     exit 7 ;;
+esac
 case "$*" in
   *"jobs?status=running"*)
     code="${STUB_JOBS_HTTP:-200}"
@@ -51,7 +59,6 @@ def deploy(tmp_path: Path):
     root = tmp_path / "checkout"
     (root / "infra").mkdir(parents=True)
     shutil.copy(_SCRIPT, root / "infra" / "deploy.sh")
-    (root / "infra" / ".env").write_text("PROD_PORT=8200\n")
     (root / ".env").write_text("API_KEY=test-key\n")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -60,7 +67,8 @@ def deploy(tmp_path: Path):
         (bin_dir / name).chmod(0o755)
     log = tmp_path / "calls.log"
 
-    def run(*args: str, **env: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    def run(*args: str, prod_port: str = "8200", **env: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        (root / "infra" / ".env").write_text(f"PROD_PORT={prod_port}\n")
         log.write_text("")
         result = subprocess.run(
             ["bash", str(root / "infra" / "deploy.sh"), *args],
@@ -165,3 +173,42 @@ def test_a_failed_reload_fails_the_deploy_and_says_what_to_run(deploy) -> None:
     result, _ = deploy("orchestrator", STUB_DOCKER_FAIL="nginx -s reload")
     assert result.returncode == 1, f"a failed reload passed: {result.stdout}{result.stderr}"
     assert "infra/deploy.sh frontend" in result.stderr, result.stderr
+
+
+# PROD_PORT is Compose's published-ports value (`"${PROD_PORT:-8200}:80"`), so
+# it may carry a bind address: `127.0.0.1:8200` publishes the dashboard on
+# loopback only, which is how a stack reached through a tunnel is run. Read as
+# a bare port it builds `http://localhost:127.0.0.1:8200/`, which answers
+# nothing — the running-jobs check then refuses the deploy, and the health wait
+# would fail the same way after the containers were recreated (#1).
+_PUBLISHED = [
+    ("8200", "http://localhost:8200"),
+    ("127.0.0.1:8200", "http://127.0.0.1:8200"),
+    ("192.168.1.10:8200", "http://192.168.1.10:8200"),
+    ("[::1]:8200", "http://[::1]:8200"),
+    # A wildcard bind is not an address to dial: reach it on loopback.
+    ("0.0.0.0:8200", "http://localhost:8200"),
+    ("[::]:8200", "http://localhost:8200"),
+]
+
+
+@pytest.mark.parametrize(("prod_port", "base"), _PUBLISHED)
+def test_the_running_jobs_check_queries_the_published_address(deploy, prod_port: str, base: str) -> None:
+    result, calls = deploy(prod_port=prod_port, STUB_API_BASE=base)
+    assert result.returncode == 0, f"PROD_PORT={prod_port} blocked the deploy: {result.stdout}{result.stderr}"
+    jobs = [call for call in calls if "jobs?status=running" in call]
+    assert jobs and all(f"{base}/api/v1/jobs" in call for call in jobs), (
+        f"PROD_PORT={prod_port}: the running-jobs check did not query {base}: {jobs}"
+    )
+
+
+@pytest.mark.parametrize(("prod_port", "base"), _PUBLISHED)
+def test_the_health_wait_polls_the_published_address(deploy, prod_port: str, base: str) -> None:
+    result, calls = deploy(prod_port=prod_port, STUB_API_BASE=base)
+    assert result.returncode == 0, f"PROD_PORT={prod_port} blocked the deploy: {result.stdout}{result.stderr}"
+    health = [call for call in calls if "/health" in call]
+    assert health, f"PROD_PORT={prod_port}: the deploy never waited for /health: {calls}"
+    assert all(f" {base}/health" in call or f" {base}/api/v1/health/ready" in call for call in health), (
+        f"PROD_PORT={prod_port}: the health wait did not poll {base}: {health}"
+    )
+    assert f"{base}/health" in result.stdout, f"PROD_PORT={prod_port}: not said out loud: {result.stdout}"
