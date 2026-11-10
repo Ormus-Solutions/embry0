@@ -36,6 +36,7 @@ rotation are [backup-restore.md](backup-restore.md).
     SQL
     ```
 - The frontend is served via nginx on port 8200 and proxies `/api` to the orchestrator container.
+- **`PROD_PORT` may carry a bind address.** It is interpolated straight into the frontend's published ports, so `PROD_PORT=127.0.0.1:8200` in `infra/.env` publishes the dashboard and the API on loopback only — the right setting when a tunnel is the only public path. `infra/deploy.sh` and `embry0 health` split the optional `<address>:` off and reach the API there; with a bare `8200`, or a wildcard bind (`0.0.0.0:8200`, `[::]:8200`), they use `localhost`.
 - Always verify health after restart: `curl -s http://localhost:8200/health`
 
 ### Deploying while jobs run
